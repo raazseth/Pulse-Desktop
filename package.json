@@ -1,0 +1,40 @@
+{
+  "name": "pulse-hud-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/main/main.js",
+  "scripts": {
+    "dev": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json && electron .",
+    "dev:local": "cross-env ELECTRON_RENDERER_URL=http://localhost:5173 tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json && electron .",
+    "build": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
+    "start": "electron .",
+    "dist": "npm run build && electron-builder --config config/electron-builder.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:check": "tsc --noEmit -p tsconfig.test.json"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.9.0",
+    "cors": "^2.8.6",
+    "electron-log": "^5.4.0",
+    "express": "^5.2.1",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.0.4",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.0.0",
+    "@types/supertest": "^6.0.2",
+    "@types/ws": "^8.18.1",
+    "cross-env": "^7.0.3",
+    "electron": "^36.3.2",
+    "electron-builder": "^25.1.8",
+    "supertest": "^7.2.2",
+    "tsc-alias": "^1.8.16",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.5"
+  }
+}

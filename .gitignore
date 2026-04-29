@@ -1,0 +1,38 @@
+# Build output
+dist/
+release/
+
+# Dependencies
+node_modules/
+
+# SQLite data (runtime, never commit)
+*.db
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+data/
+
+# Logs
+*.log
+logs/
+
+# Local text artifacts
+*.txt
+
+# electron-builder cache
+.electron-builder-cache/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Editor
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
