@@ -1,9 +1,12 @@
+import fs from "fs";
+import path from "path";
 import http from "http";
 import { WebSocketServer } from "ws";
-import { app, BrowserWindow } from "electron";
+import { app, BrowserWindow, dialog } from "electron";
 import { registerSessionIpcHandlers } from "@/ipc/session.ipc";
 import { registerSystemIpcHandlers } from "@/ipc/system.ipc";
 import { registerInterviewIpcHandlers } from "@/ipc/interview.ipc";
+import { registerDisplayIpcHandlers } from "@/ipc/display.ipc";
 import { startEmbeddedServer } from "@/server/embedded";
 import { ExportService } from "@/services/export.service";
 import { logger } from "@/utils/logger";
@@ -12,6 +15,28 @@ import { findFreePort } from "@/utils/findFreePort";
 
 export let embeddedPort = 3000;
 
+function appendRecoveryLog(line: string) {
+  try {
+    const dir = app.getPath("userData");
+    fs.appendFileSync(path.join(dir, "session-recovery.log"), `${new Date().toISOString()} ${line}\n`, "utf8");
+  } catch {
+  }
+}
+
+process.on("uncaughtException", (err) => {
+  logger.error("uncaughtException", err);
+  appendRecoveryLog(`uncaughtException: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+  try {
+    dialog.showErrorBox("Pulse HUD — unexpected error", err instanceof Error ? err.message : String(err));
+  } catch {
+  }
+});
+
+process.on("unhandledRejection", (reason) => {
+  logger.error("unhandledRejection", reason);
+  appendRecoveryLog(`unhandledRejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`);
+});
+
 let embedded: { server: http.Server; wss: WebSocketServer } | undefined;
 
 async function bootstrap() {
@@ -19,6 +44,7 @@ async function bootstrap() {
 
   registerSessionIpcHandlers(exportService);
   registerSystemIpcHandlers();
+  registerDisplayIpcHandlers();
 
   embeddedPort = await findFreePort(3000);
   registerInterviewIpcHandlers(embeddedPort);

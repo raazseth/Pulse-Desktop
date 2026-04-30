@@ -12,7 +12,7 @@ export function findFreePort(startPort = 3000, endPort = 3050): Promise<number> 
       server.once("listening", () => {
         server.close(() => resolve(port));
       });
-      server.listen(port, "127.0.0.1");
+      server.listen(port);
     };
     tryPort(startPort);
   });

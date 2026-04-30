@@ -1,6 +1,7 @@
 import path from "path";
 import { BrowserWindow } from "electron";
 import { applyMediaPermissions } from "@/utils/mediaPermissions";
+import { setInterviewMainWindow } from "@/ipc/interview.ipc";
 import { getRendererEntryFile, getRendererEntryUrl } from "@/utils/paths";
 import { logger } from "@/utils/logger";
 
@@ -96,6 +97,8 @@ export async function createAppWindow(serverPort = 3000) {
     }
     showWindow();
   }
+
+  setInterviewMainWindow(window);
 
   if (process.env.NODE_ENV !== "production") {
     window.webContents.openDevTools({ mode: "detach" });

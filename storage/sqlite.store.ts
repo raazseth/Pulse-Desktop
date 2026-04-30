@@ -5,6 +5,12 @@ import path from "path";
 interface StoredSession {
   id: string;
   context: Record<string, string>;
+  title?: string;
+  facilitator?: string;
+  audience?: string;
+  role?: string;
+  status?: string;
+  createdBy?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -35,11 +41,35 @@ interface StoredEvent {
   payload: Record<string, unknown>;
 }
 
+export interface StoredPrompt {
+  id: string;
+  sessionId: string;
+  title: string;
+  text: string;
+  timestamp: string;
+  transcriptIds: string[];
+}
+
+export interface StoredUser {
+  id: string;
+  email: string;
+  name: string;
+  passwordHash: string;
+  createdAt: string;
+}
+
+export interface StoredRefreshToken {
+  token: string;
+  userId: string;
+  expiresAt: string;
+}
+
 export interface LoadedSession {
   session: StoredSession;
   transcript: StoredEntry[];
   tags: StoredTag[];
   events: StoredEvent[];
+  prompts: StoredPrompt[];
 }
 
 export class SqliteStore {
@@ -87,15 +117,69 @@ export class SqliteStore {
       CREATE INDEX IF NOT EXISTS idx_transcript_session ON transcript_entries(session_id);
       CREATE INDEX IF NOT EXISTS idx_tags_session       ON session_tags(session_id);
       CREATE INDEX IF NOT EXISTS idx_events_session     ON session_events(session_id);
+      CREATE TABLE IF NOT EXISTS session_prompts (
+        id                  TEXT PRIMARY KEY,
+        session_id          TEXT NOT NULL,
+        title               TEXT NOT NULL,
+        text                TEXT NOT NULL,
+        timestamp           TEXT NOT NULL,
+        transcript_ids_json TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE INDEX IF NOT EXISTS idx_prompts_session ON session_prompts(session_id);
+
+      CREATE TABLE IF NOT EXISTS users (
+        id            TEXT PRIMARY KEY,
+        email         TEXT NOT NULL UNIQUE,
+        name          TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at    TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS refresh_tokens (
+        token      TEXT PRIMARY KEY,
+        user_id    TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
     `);
+    for (const ddl of [
+      "ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE sessions ADD COLUMN facilitator TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE sessions ADD COLUMN audience TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE sessions ADD COLUMN role TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+      "ALTER TABLE sessions ADD COLUMN created_by TEXT",
+    ]) {
+      try {
+        this.db.exec(ddl);
+      } catch {
+      }
+    }
   }
 
   upsertSession(session: StoredSession): void {
     this.db.prepare(`
-      INSERT INTO sessions (id, context, created_at, updated_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET context = excluded.context, updated_at = excluded.updated_at
-    `).run(session.id, JSON.stringify(session.context), session.createdAt, session.updatedAt);
+      INSERT INTO sessions (id, context, title, facilitator, audience, role, status, created_by, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        context = excluded.context,
+        title = excluded.title,
+        facilitator = excluded.facilitator,
+        audience = excluded.audience,
+        role = excluded.role,
+        status = excluded.status,
+        updated_at = excluded.updated_at
+    `).run(
+      session.id,
+      JSON.stringify(session.context),
+      session.title ?? "",
+      session.facilitator ?? "",
+      session.audience ?? "",
+      session.role ?? "",
+      session.status ?? "active",
+      session.createdBy ?? null,
+      session.createdAt,
+      session.updatedAt,
+    );
   }
 
   upsertEntry(entry: StoredEntry): void {
@@ -119,8 +203,55 @@ export class SqliteStore {
     `).run(event.id, event.sessionId, event.type, event.timestamp, JSON.stringify(event.payload));
   }
 
+  replacePromptsForSession(sessionId: string, prompts: StoredPrompt[]): void {
+    const del = this.db.prepare("DELETE FROM session_prompts WHERE session_id = ?");
+    const ins = this.db.prepare(`
+      INSERT INTO session_prompts (id, session_id, title, text, timestamp, transcript_ids_json)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    const tx = this.db.transaction(() => {
+      del.run(sessionId);
+      for (const p of prompts) {
+        ins.run(
+          p.id,
+          p.sessionId,
+          p.title,
+          p.text,
+          p.timestamp,
+          JSON.stringify(p.transcriptIds ?? []),
+        );
+      }
+    });
+    tx();
+  }
+
+  loadPromptsForSession(sessionId: string): StoredPrompt[] {
+    type Raw = {
+      id: string;
+      session_id: string;
+      title: string;
+      text: string;
+      timestamp: string;
+      transcript_ids_json: string;
+    };
+    const rows = this.db.prepare(
+      "SELECT * FROM session_prompts WHERE session_id = ? ORDER BY timestamp",
+    ).all(sessionId) as Raw[];
+    return rows.map((r) => ({
+      id: r.id,
+      sessionId: r.session_id,
+      title: r.title,
+      text: r.text,
+      timestamp: r.timestamp,
+      transcriptIds: JSON.parse(r.transcript_ids_json || "[]") as string[],
+    }));
+  }
+
   loadAll(): LoadedSession[] {
-    type RawSession = { id: string; context: string; created_at: string; updated_at: string };
+    type RawSession = {
+      id: string; context: string; title: string; facilitator: string; audience: string; role: string;
+      status: string; created_by: string | null; created_at: string; updated_at: string;
+    };
     type RawEntry  = { id: string; session_id: string; text: string; timestamp: string; speaker_id: string };
     type RawTag    = { id: string; session_id: string; transcript_id: string | null; label: string; created_at: string; created_by: string | null; metadata: string };
     type RawEvent  = { id: string; session_id: string; type: string; timestamp: string; payload: string };
@@ -149,13 +280,65 @@ export class SqliteStore {
         payload: JSON.parse(e.payload) as Record<string, unknown>,
       }));
 
+      const prompts = this.loadPromptsForSession(s.id);
+
       return {
-        session: { id: s.id, context: JSON.parse(s.context) as Record<string, string>, createdAt: s.created_at, updatedAt: s.updated_at },
+        session: {
+          id: s.id,
+          context: JSON.parse(s.context) as Record<string, string>,
+          title: s.title,
+          facilitator: s.facilitator,
+          audience: s.audience,
+          role: s.role,
+          status: s.status,
+          createdBy: s.created_by ?? undefined,
+          createdAt: s.created_at,
+          updatedAt: s.updated_at,
+        },
         transcript,
         tags,
         events,
+        prompts,
       };
     });
+  }
+
+  upsertUser(user: StoredUser): void {
+    this.db.prepare(`
+      INSERT INTO users (id, email, name, password_hash, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET email = excluded.email, name = excluded.name, password_hash = excluded.password_hash
+    `).run(user.id, user.email, user.name, user.passwordHash, user.createdAt);
+  }
+
+  loadUsers(): StoredUser[] {
+    type Raw = { id: string; email: string; name: string; password_hash: string; created_at: string };
+    const rows = this.db.prepare("SELECT * FROM users").all() as Raw[];
+    return rows.map((r) => ({
+      id: r.id,
+      email: r.email,
+      name: r.name,
+      passwordHash: r.password_hash,
+      createdAt: r.created_at,
+    }));
+  }
+
+  upsertRefreshToken(token: StoredRefreshToken): void {
+    this.db.prepare(`
+      INSERT INTO refresh_tokens (token, user_id, expires_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(token) DO UPDATE SET user_id = excluded.user_id, expires_at = excluded.expires_at
+    `).run(token.token, token.userId, token.expiresAt);
+  }
+
+  deleteRefreshToken(token: string): void {
+    this.db.prepare("DELETE FROM refresh_tokens WHERE token = ?").run(token);
+  }
+
+  loadRefreshTokens(): StoredRefreshToken[] {
+    type Raw = { token: string; user_id: string; expires_at: string };
+    const rows = this.db.prepare("SELECT * FROM refresh_tokens").all() as Raw[];
+    return rows.map((r) => ({ token: r.token, userId: r.user_id, expiresAt: r.expires_at }));
   }
 
   close(): void {

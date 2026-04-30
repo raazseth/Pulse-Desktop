@@ -255,14 +255,14 @@ describe("HUD session routes", () => {
         .expect(401);
     });
 
-    it("defaults speakerId to 'speaker-1' when omitted", async () => {
+    it("defaults speakerId to 'interviewee' when omitted", async () => {
       const res = await agent
         .post(`/api/v1/hud/sessions/${sessionId}/transcript`)
         .set("Authorization", authHeader)
         .send({ text: "An anonymous utterance" })
         .expect(201);
 
-      expect(res.body.data.entry.speakerId).toBe("speaker-1");
+      expect(res.body.data.entry.speakerId).toBe("interviewee");
     });
 
     it("detects keyword signals in matching text", async () => {

@@ -1,4 +1,6 @@
 import crypto from "crypto";
+import fs from "fs";
+import path from "path";
 import { promisify } from "util";
 import http from "http";
 import { URL } from "url";
@@ -10,6 +12,35 @@ import { logger } from "@/utils/logger";
 import { LIVE_PULSE_WEB_ORIGINS } from "@/utils/liveUrls";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+async function transcribeOpenAiWhisper(
+  bodyBuf: Buffer,
+  mimeType: string,
+  langQuery: string,
+  apiKey: string,
+): Promise<string> {
+  const form = new FormData();
+  const mt = mimeType.split(";")[0].trim() || "audio/webm";
+  const isMp4 = mt.includes("mp4");
+  const filename = isMp4 ? "chunk.m4a" : "chunk.webm";
+  const blob = new Blob([new Uint8Array(bodyBuf)], { type: mt });
+  form.append("file", blob, filename);
+  form.append("model", "whisper-1");
+  const short = /^[a-z]{2}/i.exec(String(langQuery).split("-")[0] ?? "")?.[0]?.toLowerCase();
+  if (short) form.append("language", short);
+
+  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey.trim()}` },
+    body: form,
+  });
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`OpenAI ${res.status}: ${errBody.slice(0, 400)}`);
+  }
+  const json = (await res.json()) as { text?: string };
+  return (json.text ?? "").trim();
+}
 
 const scryptAsync = promisify(crypto.scrypt);
 
@@ -33,6 +64,12 @@ const REFRESH_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 interface HudSession {
   id: string;
   context: Record<string, string>;
+  title: string;
+  facilitator: string;
+  audience: string;
+  role: string;
+  status: "active" | "paused" | "ended";
+  createdBy: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -85,6 +122,7 @@ interface SessionSnapshot {
   session: HudSession;
   transcriptEntries: TranscriptEntry[];
   tags: SessionTag[];
+  notes: [];
   prompts: PromptSuggestion[];
   events: SessionEvent[];
   signals: SignalCue[];
@@ -129,19 +167,50 @@ function createStore(): MemStore {
   };
 }
 
-function ensureSession(store: MemStore, sessionId: string, context: Record<string, string> = {}, sqlite?: SqliteStore): HudSession {
+function ensureSession(
+  store: MemStore,
+  sessionId: string,
+  context: Record<string, string> = {},
+  sqlite?: SqliteStore,
+  createdBy?: string,
+  metadata: Partial<Pick<HudSession, "title" | "facilitator" | "audience" | "role" | "status">> = {},
+): HudSession {
   const now = new Date().toISOString();
   const existing = store.sessions.get(sessionId);
   if (existing) {
     const merged = { ...existing.context, ...context };
-    const updated = { ...existing, context: merged, updatedAt: now };
+    const updated = {
+      ...existing,
+      ...metadata,
+      context: merged,
+      updatedAt: now,
+    };
     store.sessions.set(sessionId, updated);
     sqlite?.upsertSession(updated);
     return updated;
   }
-  const session: HudSession = { id: sessionId, context, createdAt: now, updatedAt: now };
+  if (!createdBy) throw new Error("createdBy is required to create a session");
+  const session: HudSession = {
+    id: sessionId,
+    context,
+    title: metadata.title ?? "Untitled Session",
+    facilitator: metadata.facilitator ?? "",
+    audience: metadata.audience ?? "",
+    role: metadata.role ?? "",
+    status: metadata.status ?? "active",
+    createdBy,
+    createdAt: now,
+    updatedAt: now,
+  };
   store.sessions.set(sessionId, session);
   sqlite?.upsertSession(session);
+  return session;
+}
+
+function assertSessionAccess(store: MemStore, userId: string, sessionId: string): HudSession {
+  const session = store.sessions.get(sessionId);
+  if (!session) throw new Error("Session not found");
+  if (session.createdBy !== userId) throw new Error("Forbidden");
   return session;
 }
 
@@ -162,7 +231,7 @@ function getSnapshot(store: MemStore, sessionId: string): SessionSnapshot | null
       label: e.payload.label as string,
       timestamp: e.timestamp,
     }));
-  return { session, transcriptEntries, tags, prompts, events, signals };
+  return { session, transcriptEntries, tags, notes: [], prompts, events, signals };
 }
 
 function saveEvent(store: MemStore, sessionId: string, type: string, payload: Record<string, unknown>, sqlite?: SqliteStore): SessionEvent {
@@ -222,10 +291,14 @@ function buildPrompts(sessionId: string, recent: TranscriptEntry[], context?: Re
 
 function processChunk(
   store: MemStore,
-  input: { sessionId: string; text: string; speakerId?: string; timestamp?: string; context?: Record<string, string> },
+  input: { sessionId: string; userId: string; text: string; speakerId?: string; timestamp?: string; context?: Record<string, string> },
   sqlite?: SqliteStore,
 ): { entry: TranscriptEntry; prompts: PromptSuggestion[]; signals: SignalCue[] } {
-  ensureSession(store, input.sessionId, input.context ?? {}, sqlite);
+  const existing = store.sessions.get(input.sessionId);
+  if (existing && existing.createdBy !== input.userId) {
+    throw new Error("Forbidden");
+  }
+  ensureSession(store, input.sessionId, input.context ?? {}, sqlite, input.userId);
 
   const text = input.text.trim();
   if (!text) throw new Error("Transcript text is required");
@@ -235,7 +308,7 @@ function processChunk(
     sessionId: input.sessionId,
     text,
     timestamp: input.timestamp ?? new Date().toISOString(),
-    speakerId: input.speakerId?.trim() || "speaker-1",
+    speakerId: input.speakerId?.trim() || "interviewee",
   };
 
   const transcriptList = store.transcript.get(input.sessionId) ?? [];
@@ -254,6 +327,17 @@ function processChunk(
   const prompts = buildPrompts(entry.sessionId, recent, session?.context);
 
   store.prompts.set(input.sessionId, prompts);
+  sqlite?.replacePromptsForSession(
+    input.sessionId,
+    prompts.map((p) => ({
+      id: p.id,
+      sessionId: p.sessionId,
+      title: p.title,
+      text: p.text,
+      timestamp: p.timestamp,
+      transcriptIds: p.transcriptIds ?? [],
+    })),
+  );
   saveEvent(store, entry.sessionId, "prompt:update", { count: prompts.length }, sqlite);
 
   return { entry, prompts, signals };
@@ -269,6 +353,20 @@ function exportToCsv(snap: SessionSnapshot): string {
     ...snap.transcriptEntries.map((e) => toCsvRow(["transcript", e.id, e.sessionId, e.timestamp, e.speakerId, e.text, "", "", "", ""])),
     ...snap.tags.map((t) => toCsvRow(["tag", t.id, t.sessionId, t.createdAt, "", "", t.label, t.transcriptId ?? "", "", JSON.stringify(t.metadata)])),
     ...snap.events.map((e) => toCsvRow(["event", e.id, e.sessionId, e.timestamp, "", "", "", "", e.type, JSON.stringify(e.payload)])),
+    ...snap.prompts.map((p) =>
+      toCsvRow([
+        "prompt",
+        p.id,
+        p.sessionId,
+        p.timestamp,
+        "",
+        p.text,
+        p.title,
+        (p.transcriptIds ?? []).join("|"),
+        "",
+        "",
+      ]),
+    ),
   ].join("\n");
 }
 
@@ -305,15 +403,55 @@ class ConnectionManager {
   }
 }
 
-export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Server; wss: WebSocketServer } {
+export function createEmbeddedServer(
+  sqlite?: SqliteStore,
+  options?: { captureDir?: string },
+): { server: http.Server; wss: WebSocketServer } {
+  const captureDir = options?.captureDir;
   const store = createStore();
 
   if (sqlite) {
+    for (const user of sqlite.loadUsers()) {
+      store.users.set(user.id, user);
+      store.usersByEmail.set(user.email, user.id);
+    }
+    for (const token of sqlite.loadRefreshTokens()) {
+      if (new Date(token.expiresAt) >= new Date()) {
+        store.refreshTokens.set(token.token, { userId: token.userId, expiresAt: token.expiresAt });
+      } else {
+        sqlite.deleteRefreshToken(token.token);
+      }
+    }
     for (const data of sqlite.loadAll()) {
-      store.sessions.set(data.session.id, data.session);
+      if (!data.session.createdBy) continue;
+      store.sessions.set(data.session.id, {
+        id: data.session.id,
+        context: data.session.context,
+        title: data.session.title ?? "",
+        facilitator: data.session.facilitator ?? "",
+        audience: data.session.audience ?? "",
+        role: data.session.role ?? "",
+        status: (data.session.status === "paused" || data.session.status === "ended" ? data.session.status : "active"),
+        createdBy: data.session.createdBy,
+        createdAt: data.session.createdAt,
+        updatedAt: data.session.updatedAt,
+      });
       store.transcript.set(data.session.id, data.transcript);
       store.tags.set(data.session.id, data.tags);
       store.events.set(data.session.id, data.events);
+      if (data.prompts.length) {
+        store.prompts.set(
+          data.session.id,
+          data.prompts.map((p) => ({
+            id: p.id,
+            sessionId: p.sessionId,
+            title: p.title,
+            text: p.text,
+            timestamp: p.timestamp,
+            transcriptIds: p.transcriptIds,
+          })),
+        );
+      }
     }
   }
 
@@ -329,7 +467,11 @@ export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Serve
   }
 
   const app = express();
-  app.use(express.json({ limit: "1mb" }));
+  const jsonParser = express.json({ limit: "1mb" });
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (req.path === "/api/v1/hud/audio/transcribe" && req.method === "POST") return next();
+    return jsonParser(req, res, next);
+  });
 
   const ALLOWED_ORIGINS = new Set<string>([
     "http://localhost:5173",
@@ -365,7 +507,9 @@ export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Serve
     const accessToken = generateToken();
     const refreshToken = generateToken();
     store.accessTokens.set(accessToken, { userId, expiresAt: new Date(now + ACCESS_TTL_MS).toISOString() });
-    store.refreshTokens.set(refreshToken, { userId, expiresAt: new Date(now + REFRESH_TTL_MS).toISOString() });
+    const refreshRecord = { userId, expiresAt: new Date(now + REFRESH_TTL_MS).toISOString() };
+    store.refreshTokens.set(refreshToken, refreshRecord);
+    sqlite?.upsertRefreshToken({ token: refreshToken, ...refreshRecord });
     return { accessToken, refreshToken };
   }
 
@@ -378,12 +522,97 @@ export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Serve
   }
 
   function authenticate(req: Request, res: Response, next: NextFunction): void {
-    if (!resolveAccessToken(req)) {
+    const user = resolveAccessToken(req);
+    if (!user) {
       res.status(401).json({ success: false, message: "Authentication required" });
       return;
     }
+    res.locals.user = user;
     next();
   }
+
+  function requireUser(res: Response): AuthUser {
+    const user = res.locals.user as AuthUser | undefined;
+    if (!user) throw new Error("Authentication required");
+    return user;
+  }
+
+  app.post(
+    "/api/v1/hud/audio/transcribe",
+    express.raw({ type: "*/*", limit: "25mb" }),
+    (req: Request, res: Response, next: NextFunction) => {
+      const user = resolveAccessToken(req);
+      if (!user) {
+        res.status(401).json({ success: false, message: "Authentication required" });
+        return;
+      }
+      res.locals.user = user;
+      next();
+    },
+    async (req: Request, res: Response) => {
+      try {
+        const user = requireUser(res);
+        const sessionId = String(req.query.sessionId ?? "desktop-mic").trim().slice(0, 200);
+        const existing = store.sessions.get(sessionId);
+        if (existing && existing.createdBy !== user.id) {
+          res.status(403).json({ success: false, message: "Forbidden" });
+          return;
+        }
+        ensureSession(store, sessionId, {}, sqlite, user.id);
+        const bodyBuf = Buffer.isBuffer(req.body) ? (req.body as Buffer) : Buffer.alloc(0);
+        if (bodyBuf.length < 32) {
+          res.json({ success: true, data: { text: "", savedToDisk: false } });
+          return;
+        }
+
+        const mimeHint = String(req.query.mime ?? req.headers["content-type"] ?? "audio/webm");
+        const langQ = String(req.query.lang ?? "en-US");
+
+        const openAiKey = (process.env.PULSE_OPENAI_API_KEY ?? process.env.OPENAI_API_KEY ?? "").trim();
+        if (openAiKey) {
+          try {
+            const text = await transcribeOpenAiWhisper(bodyBuf, mimeHint, langQ, openAiKey);
+            res.json({ success: true, data: { text } });
+            return;
+          } catch (err) {
+            logger.error("OpenAI audio transcribe failed", err);
+            res.status(502).json({
+              success: false,
+              message: err instanceof Error ? err.message : "OpenAI transcription failed",
+            });
+            return;
+          }
+        }
+
+        if (!captureDir) {
+          res.status(503).json({
+            success: false,
+            message:
+              "Voice transcription in the desktop app requires OPENAI_API_KEY or PULSE_OPENAI_API_KEY in the environment (Whisper API). Optionally set a capture directory to save raw audio only.",
+          });
+          return;
+        }
+        const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120) || "desktop-mic";
+        const sub = path.join(captureDir, safe);
+        fs.mkdirSync(sub, { recursive: true });
+        const ext = mimeHint.includes("mp4") ? "m4a" : "webm";
+        const fn = `${Date.now()}.${ext}`;
+        fs.writeFileSync(path.join(sub, fn), bodyBuf);
+        res.json({
+          success: true,
+          data: {
+            text: "",
+            savedToDisk: true,
+            relativePath: path.join(safe, fn),
+            hint: "Set OPENAI_API_KEY for live transcription, or batch these files with a local model.",
+          },
+        });
+      } catch (err) {
+        logger.error("POST /hud/audio/transcribe", err);
+        res.status(500).json({ success: false, message: "Transcription handler error" });
+      }
+    },
+  );
 
   app.post("/api/v1/auth/register", async (req: Request, res: Response) => {
     const { email, password, name } = req.body as Record<string, string>;
@@ -412,6 +641,7 @@ export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Serve
     const user: AuthUser = { id: crypto.randomUUID(), email: normalizedEmail, name: name.trim(), passwordHash, createdAt: new Date().toISOString() };
     store.users.set(user.id, user);
     store.usersByEmail.set(user.email, user.id);
+    sqlite?.upsertUser(user);
     const tokens = issueTokens(user.id);
     res.status(201).json({ success: true, data: { user: { id: user.id, email: user.email, name: user.name, createdAt: user.createdAt }, tokens } });
   });
@@ -454,13 +684,17 @@ export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Serve
       return;
     }
     store.refreshTokens.delete(refreshToken);
+    sqlite?.deleteRefreshToken(refreshToken);
     const tokens = issueTokens(user.id);
     res.json({ success: true, data: { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken, user: { id: user.id, email: user.email, name: user.name, createdAt: user.createdAt } } });
   });
 
   app.delete("/api/v1/auth/logout", (req: Request, res: Response) => {
     const { refreshToken } = req.body as { refreshToken?: string };
-    if (refreshToken) store.refreshTokens.delete(refreshToken);
+    if (refreshToken) {
+      store.refreshTokens.delete(refreshToken);
+      sqlite?.deleteRefreshToken(refreshToken);
+    }
     res.json({ success: true, data: null, message: "Logged out" });
   });
 
@@ -479,30 +713,129 @@ export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Serve
 
   app.use("/api/v1/hud", authenticate);
 
-  app.get("/api/v1/hud/sessions/:sessionId", (req, res) => {
+  app.get("/api/v1/hud/sessions", (_req, res) => {
+    const user = requireUser(res);
+    const sessions = Array.from(store.sessions.values())
+      .filter((session) => session.createdBy === user.id)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.createdAt.localeCompare(a.createdAt));
+    const summaries = sessions.map((session) => ({
+      id: session.id,
+      title: session.title || "Untitled Session",
+      status: session.status,
+      noteCount: 0,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+    }));
+    const lastActiveSession = summaries.find((session) => session.status === "active") ?? summaries[0] ?? null;
+    res.json({
+      success: true,
+      data: summaries,
+      lastActiveSessionId: lastActiveSession?.id ?? null,
+      lastActiveSession,
+    });
+  });
+
+  app.post("/api/v1/hud/sessions", (req, res) => {
+    const user = requireUser(res);
+    const body = req.body as Partial<Pick<HudSession, "title" | "facilitator" | "audience" | "role">>;
+    const title = typeof body.title === "string" && body.title.trim() ? body.title.trim() : "Untitled Session";
+    const session = ensureSession(store, crypto.randomUUID(), {}, sqlite, user.id, {
+      title,
+      facilitator: body.facilitator ?? "",
+      audience: body.audience ?? "",
+      role: body.role ?? "",
+      status: "active",
+    });
+    res.status(201).json({
+      success: true,
+      data: {
+        id: session.id,
+        title: session.title,
+        status: session.status,
+        noteCount: 0,
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+      },
+      message: "Session created",
+    });
+  });
+
+  app.patch("/api/v1/hud/sessions/:sessionId/status", (req: Request, res: Response) => {
+    const user = requireUser(res);
     const sid = String(req.params.sessionId);
-    const snap = getSnapshot(store, sid) ?? (() => { ensureSession(store, sid, {}, sqlite); return getSnapshot(store, sid)!; })();
+    const status = (req.body as { status?: string }).status;
+    if (status !== "active" && status !== "paused" && status !== "ended") {
+      res.status(400).json({ success: false, message: "Invalid status" });
+      return;
+    }
+    try {
+      assertSessionAccess(store, user.id, sid);
+      const updated = ensureSession(store, sid, {}, sqlite, user.id, { status });
+      res.json({ success: true, data: { sessionId: sid, status: updated.status } });
+    } catch (err) {
+      res.status(err instanceof Error && err.message === "Forbidden" ? 403 : 404).json({ success: false, message: err instanceof Error ? err.message : "Session not found" });
+    }
+  });
+
+  app.post("/api/v1/hud/sessions/:sessionId/start", (req: Request, res: Response) => {
+    const user = requireUser(res);
+    const sid = String(req.params.sessionId);
+    try {
+      assertSessionAccess(store, user.id, sid);
+      const updated = ensureSession(store, sid, {}, sqlite, user.id, { status: "active" });
+      res.json({ success: true, data: { sessionId: sid, status: updated.status } });
+    } catch (err) {
+      res.status(err instanceof Error && err.message === "Forbidden" ? 403 : 404).json({ success: false, message: err instanceof Error ? err.message : "Session not found" });
+    }
+  });
+
+  app.post("/api/v1/hud/sessions/:sessionId/stop", (req: Request, res: Response) => {
+    const user = requireUser(res);
+    const sid = String(req.params.sessionId);
+    try {
+      assertSessionAccess(store, user.id, sid);
+      const updated = ensureSession(store, sid, {}, sqlite, user.id, { status: "ended" });
+      res.json({ success: true, data: { sessionId: sid, status: updated.status } });
+    } catch (err) {
+      res.status(err instanceof Error && err.message === "Forbidden" ? 403 : 404).json({ success: false, message: err instanceof Error ? err.message : "Session not found" });
+    }
+  });
+
+  app.get("/api/v1/hud/sessions/:sessionId", (req, res) => {
+    const user = requireUser(res);
+    const sid = String(req.params.sessionId);
+    try {
+      assertSessionAccess(store, user.id, sid);
+    } catch (err) {
+      res.status(err instanceof Error && err.message === "Forbidden" ? 403 : 404).json({ success: false, message: err instanceof Error ? err.message : "Session not found" });
+      return;
+    }
+    const snap = getSnapshot(store, sid);
     res.json({ success: true, data: snap });
   });
 
   app.post("/api/v1/hud/sessions/:sessionId/transcript", (req: Request, res: Response, next: NextFunction) => {
     try {
+      const user = requireUser(res);
       const sid = String(req.params.sessionId);
       const body = req.body as { text?: string; speakerId?: string; timestamp?: string; context?: Record<string, string> };
-      const result = processChunk(store, { sessionId: sid, text: body.text ?? "", speakerId: body.speakerId, timestamp: body.timestamp, context: body.context }, sqlite);
+      const result = processChunk(store, { sessionId: sid, userId: user.id, text: body.text ?? "", speakerId: body.speakerId, timestamp: body.timestamp, context: body.context }, sqlite);
       res.status(201).json({ success: true, data: result });
     } catch (e) { next(e); }
   });
 
   app.post("/api/v1/hud/sessions/:sessionId/tags", (req: Request, res: Response, next: NextFunction) => {
     try {
+      const user = requireUser(res);
       const sid = String(req.params.sessionId);
       const { label, transcriptId, createdBy, metadata } = req.body as Record<string, string>;
       if (!label?.trim()) {
         res.status(400).json({ success: false, message: "Tag label required" });
         return;
       }
-      ensureSession(store, sid, {}, sqlite);
+      const existing = store.sessions.get(sid);
+      if (existing && existing.createdBy !== user.id) throw new Error("Forbidden");
+      ensureSession(store, sid, {}, sqlite, user.id);
       const tag: SessionTag = {
         id: crypto.randomUUID(), sessionId: sid, transcriptId, label: label.trim(),
         createdAt: new Date().toISOString(), createdBy,
@@ -518,6 +851,7 @@ export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Serve
   });
 
   app.patch("/api/v1/hud/sessions/:sessionId/context", (req: Request, res: Response) => {
+    const user = requireUser(res);
     const sid = String(req.params.sessionId);
     const body = req.body as { context?: unknown };
     const context =
@@ -526,13 +860,25 @@ export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Serve
       !Array.isArray(body.context)
         ? (body.context as Record<string, string>)
         : {};
-    ensureSession(store, sid, context, sqlite);
+    const existing = store.sessions.get(sid);
+    if (existing && existing.createdBy !== user.id) {
+      res.status(403).json({ success: false, message: "Forbidden" });
+      return;
+    }
+    ensureSession(store, sid, context, sqlite, user.id);
     saveEvent(store, sid, "session:context-updated", { context }, sqlite);
     res.json({ success: true, data: getSnapshot(store, sid)! });
   });
 
   app.get("/api/v1/hud/sessions/:sessionId/export", (req, res) => {
+    const user = requireUser(res);
     const sid = String(req.params.sessionId);
+    try {
+      assertSessionAccess(store, user.id, sid);
+    } catch (err) {
+      res.status(err instanceof Error && err.message === "Forbidden" ? 403 : 404).json({ success: false, message: err instanceof Error ? err.message : "Session not found" });
+      return;
+    }
     const snap = getSnapshot(store, sid);
     if (!snap) {
       res.status(404).json({ success: false, message: "Session not found" });
@@ -552,29 +898,38 @@ export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Serve
 
   const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
     logger.error("Embedded server error", err);
-    res.status(500).json({ success: false, message: err instanceof Error ? err.message : "Internal server error" });
+    const message = err instanceof Error ? err.message : "Internal server error";
+    const status = message === "Forbidden" ? 403 : message === "Session not found" ? 404 : 500;
+    res.status(status).json({ success: false, message });
   };
   app.use(errorHandler);
 
   const server = http.createServer(app);
   const manager = new ConnectionManager();
   const wss = new WebSocketServer({ noServer: true });
+  const socketUsers = new WeakMap<WebSocket, string>();
 
   server.on("upgrade", (request, socket, head) => {
     const url = new URL(request.url ?? "", "http://localhost");
     if (url.pathname !== "/ws/transcript") return;
 
     const token = url.searchParams.get("token");
-    if (token) {
-      const record = store.accessTokens.get(token);
-      if (!record || new Date(record.expiresAt) < new Date()) {
-        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-        socket.destroy();
-        return;
-      }
+    if (!token) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    const record = store.accessTokens.get(token);
+    if (!record || new Date(record.expiresAt) < new Date()) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
     }
 
-    wss.handleUpgrade(request, socket, head, (ws) => wss.emit("connection", ws));
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      socketUsers.set(ws, record.userId);
+      wss.emit("connection", ws);
+    });
   });
 
   wss.on("connection", (socket: WebSocket) => {
@@ -597,11 +952,23 @@ export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Serve
       const msg = parsed as { type: string; payload: Record<string, unknown> };
 
       try {
+        const userId = socketUsers.get(socket);
+        if (!userId) {
+          socket.send(JSON.stringify({ type: "error", payload: { message: "Authentication required" } }));
+          return;
+        }
+
         if (msg.type === "session:subscribe") {
           const sessionId = String(msg.payload.sessionId ?? "");
           if (!sessionId || sessionId.length > 200) { socket.send(JSON.stringify({ type: "error", payload: { message: "Invalid sessionId" } })); return; }
+          try {
+            assertSessionAccess(store, userId, sessionId);
+          } catch {
+            socket.send(JSON.stringify({ type: "error", payload: { message: "Session not found" } }));
+            return;
+          }
           manager.subscribe(socket, sessionId);
-          const snap = getSnapshot(store, sessionId) ?? (() => { ensureSession(store, sessionId, {}, sqlite); return getSnapshot(store, sessionId)!; })();
+          const snap = getSnapshot(store, sessionId)!;
           socket.send(JSON.stringify({ type: "session:state", payload: snap }));
           return;
         }
@@ -611,11 +978,47 @@ export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Serve
           const text = String(msg.payload.text ?? "").trim();
           if (!sessionId || sessionId.length > 200) { socket.send(JSON.stringify({ type: "error", payload: { message: "Invalid sessionId" } })); return; }
           if (!text || text.length > 10_000) { socket.send(JSON.stringify({ type: "error", payload: { message: "text is required and must be ≤10,000 chars" } })); return; }
-          const p = { sessionId, text, speakerId: msg.payload.speakerId as string | undefined, timestamp: msg.payload.timestamp as string | undefined, context: msg.payload.context as Record<string, string> | undefined };
+          const p = { sessionId, userId, text, speakerId: msg.payload.speakerId as string | undefined, timestamp: msg.payload.timestamp as string | undefined, context: msg.payload.context as Record<string, string> | undefined };
           const result = processChunk(store, p, sqlite);
           manager.broadcast(p.sessionId, { type: "transcript:chunk", payload: result.entry });
           manager.broadcast(p.sessionId, { type: "prompt:update", payload: result.prompts });
           if (result.signals.length) manager.broadcast(p.sessionId, { type: "signal:detected", payload: result.signals });
+          return;
+        }
+
+        if (msg.type === "audio:chunk") {
+          const sessionId = String(msg.payload.sessionId ?? "");
+          const audioB64 = String(msg.payload.audio ?? "");
+          if (!sessionId || sessionId.length > 200) {
+            socket.send(JSON.stringify({ type: "error", payload: { message: "Invalid sessionId" } }));
+            return;
+          }
+          try {
+            assertSessionAccess(store, userId, sessionId);
+          } catch {
+            socket.send(JSON.stringify({ type: "error", payload: { message: "Session not found" } }));
+            return;
+          }
+          if (audioB64.length > 2_200_000) {
+            socket.send(JSON.stringify({ type: "error", payload: { message: "audio payload too large" } }));
+            return;
+          }
+          let buf: Buffer;
+          try {
+            buf = Buffer.from(audioB64, "base64");
+          } catch {
+            socket.send(JSON.stringify({ type: "error", payload: { message: "Invalid base64 audio" } }));
+            return;
+          }
+          if (captureDir && buf.length >= 32) {
+            const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120) || "session";
+            const sub = path.join(captureDir, safe);
+            fs.mkdirSync(sub, { recursive: true });
+            const mimeHint = String(msg.payload.mimeType ?? "audio/webm");
+            const ext = mimeHint.includes("mp4") ? "m4a" : "webm";
+            const fn = `ws-${Date.now()}.${ext}`;
+            fs.writeFileSync(path.join(sub, fn), buf);
+          }
           return;
         }
 
@@ -624,7 +1027,12 @@ export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Serve
           const label = String(msg.payload.label ?? "").trim();
           if (!sessionId || sessionId.length > 200) { socket.send(JSON.stringify({ type: "error", payload: { message: "Invalid sessionId" } })); return; }
           if (!label || label.length > 200) { socket.send(JSON.stringify({ type: "error", payload: { message: "label is required and must be ≤200 chars" } })); return; }
-          ensureSession(store, sessionId, {}, sqlite);
+          const existing = store.sessions.get(sessionId);
+          if (existing && existing.createdBy !== userId) {
+            socket.send(JSON.stringify({ type: "error", payload: { message: "Forbidden" } }));
+            return;
+          }
+          ensureSession(store, sessionId, {}, sqlite, userId);
           const tag: SessionTag = { id: crypto.randomUUID(), sessionId, transcriptId: msg.payload.transcriptId as string | undefined, label, createdAt: new Date().toISOString(), createdBy: msg.payload.createdBy as string | undefined, metadata: (msg.payload.metadata as Record<string, string>) ?? {} };
           const list = store.tags.get(sessionId) ?? [];
           list.push(tag);
@@ -639,7 +1047,12 @@ export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Serve
           const sessionId = String(msg.payload.sessionId ?? "");
           if (!sessionId || sessionId.length > 200) { socket.send(JSON.stringify({ type: "error", payload: { message: "Invalid sessionId" } })); return; }
           const context = (msg.payload.context ?? {}) as Record<string, string>;
-          ensureSession(store, sessionId, context, sqlite);
+          const existing = store.sessions.get(sessionId);
+          if (existing && existing.createdBy !== userId) {
+            socket.send(JSON.stringify({ type: "error", payload: { message: "Forbidden" } }));
+            return;
+          }
+          ensureSession(store, sessionId, context, sqlite, userId);
           saveEvent(store, sessionId, "session:context-updated", { context }, sqlite);
           const snap = getSnapshot(store, sessionId)!;
           manager.broadcast(sessionId, { type: "session:state", payload: snap });
@@ -663,10 +1076,12 @@ export function createEmbeddedServer(sqlite?: SqliteStore): { server: http.Serve
 
 export function startEmbeddedServer(port: number = 3000, dataDir?: string): { server: http.Server; wss: WebSocketServer } {
   const sqlite = dataDir ? new SqliteStore(dataDir) : undefined;
-  const { server, wss } = createEmbeddedServer(sqlite);
+  const captureDir = dataDir ? path.join(dataDir, "audio-capture") : undefined;
+  if (captureDir) fs.mkdirSync(captureDir, { recursive: true });
+  const { server, wss } = createEmbeddedServer(sqlite, { captureDir });
   server.once("error", (err) => {
     logger.error(`Embedded HUD failed to bind port ${port}`, err);
   });
-  server.listen(port);
+  server.listen(port, "127.0.0.1");
   return { server, wss };
 }

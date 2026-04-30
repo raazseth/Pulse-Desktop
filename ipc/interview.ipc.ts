@@ -1,11 +1,33 @@
 import path from "path";
-import { BrowserWindow, ipcMain, screen } from "electron";
+import { BrowserWindow, ipcMain, screen, type WebContents } from "electron";
 import { applyMediaPermissions } from "@/utils/mediaPermissions";
 
 let pipWin: BrowserWindow | null = null;
+let mainBridgeWebContents: WebContents | null = null;
+let lastTranscriptBridgeState: unknown = null;
+
+export function setInterviewMainWindow(win: BrowserWindow) {
+  mainBridgeWebContents = win.webContents;
+}
 
 export function registerInterviewIpcHandlers(serverPort: number) {
   const preloadPath = path.join(__dirname, "../preload/preload.js");
+
+  ipcMain.on("transcript-bridge:push", (event, payload: unknown) => {
+    if (!mainBridgeWebContents || event.sender !== mainBridgeWebContents) return;
+    lastTranscriptBridgeState = payload;
+    if (pipWin && !pipWin.isDestroyed()) {
+      pipWin.webContents.send("transcript-bridge:state", payload);
+    }
+  });
+
+  ipcMain.handle("transcript-bridge:get-snapshot", () => lastTranscriptBridgeState);
+
+  ipcMain.on("transcript-bridge:send-chunk", (event, payload: unknown) => {
+    if (!pipWin || pipWin.isDestroyed() || !mainBridgeWebContents) return;
+    if (event.sender !== pipWin.webContents) return;
+    mainBridgeWebContents.send("transcript-bridge:send-chunk", payload);
+  });
 
   ipcMain.handle("interview:start", async () => {
     if (pipWin && !pipWin.isDestroyed()) {
@@ -41,6 +63,8 @@ export function registerInterviewIpcHandlers(serverPort: number) {
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: true,
+        // Same session as the main window so localStorage (auth + HUD session) is shared — otherwise the HUD asks for login again.
+        session: mainWin.webContents.session,
         additionalArguments: [`--server-port=${serverPort}`],
       },
     });
@@ -49,8 +73,13 @@ export function registerInterviewIpcHandlers(serverPort: number) {
 
     await pipWin.loadURL(pipUrl);
 
+    if (!mainWin.isDestroyed()) {
+      mainWin.webContents.send("transcript-bridge:please-push");
+    }
+
     pipWin.on("closed", () => {
       pipWin = null;
+      lastTranscriptBridgeState = null;
     });
   });
 
@@ -59,5 +88,6 @@ export function registerInterviewIpcHandlers(serverPort: number) {
       pipWin.close();
     }
     pipWin = null;
+    lastTranscriptBridgeState = null;
   });
 }
