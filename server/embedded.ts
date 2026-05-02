@@ -10,6 +10,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { SqliteStore } from "@/storage/sqlite.store";
 import { logger } from "@/utils/logger";
 import { LIVE_PULSE_WEB_ORIGINS } from "@/utils/liveUrls";
+import { desktopTranscriptionService } from "@/server/transcription";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -584,29 +585,25 @@ export function createEmbeddedServer(
           }
         }
 
-        if (!captureDir) {
-          res.status(503).json({
+        try {
+          const rawLang = langQ.split("-")[0]?.toLowerCase() ?? "en";
+          const lang = /^[a-z]{2,3}$/.test(rawLang) ? rawLang : "en";
+          const text = await desktopTranscriptionService.transcribe(bodyBuf, lang, mimeHint);
+          if (captureDir) {
+            const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120) || "desktop-mic";
+            const sub = path.join(captureDir, safe);
+            fs.mkdirSync(sub, { recursive: true });
+            const ext = mimeHint.includes("mp4") ? "m4a" : "webm";
+            fs.writeFileSync(path.join(sub, `${Date.now()}.${ext}`), bodyBuf);
+          }
+          res.json({ success: true, data: { text } });
+        } catch (err) {
+          logger.error("Local Whisper transcription failed", err);
+          res.status(502).json({
             success: false,
-            message:
-              "Voice transcription in the desktop app requires OPENAI_API_KEY or PULSE_OPENAI_API_KEY in the environment (Whisper API). Optionally set a capture directory to save raw audio only.",
+            message: err instanceof Error ? err.message : "Local Whisper transcription failed",
           });
-          return;
         }
-        const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120) || "desktop-mic";
-        const sub = path.join(captureDir, safe);
-        fs.mkdirSync(sub, { recursive: true });
-        const ext = mimeHint.includes("mp4") ? "m4a" : "webm";
-        const fn = `${Date.now()}.${ext}`;
-        fs.writeFileSync(path.join(sub, fn), bodyBuf);
-        res.json({
-          success: true,
-          data: {
-            text: "",
-            savedToDisk: true,
-            relativePath: path.join(safe, fn),
-            hint: "Set OPENAI_API_KEY for live transcription, or batch these files with a local model.",
-          },
-        });
       } catch (err) {
         logger.error("POST /hud/audio/transcribe", err);
         res.status(500).json({ success: false, message: "Transcription handler error" });
@@ -1010,14 +1007,54 @@ export function createEmbeddedServer(
             socket.send(JSON.stringify({ type: "error", payload: { message: "Invalid base64 audio" } }));
             return;
           }
-          if (captureDir && buf.length >= 32) {
+          if (buf.length < 32) return;
+
+          const mimeHint = String(msg.payload.mimeType ?? "audio/webm");
+          const speakerId = String(msg.payload.speakerId ?? "system").trim() || "system";
+          const rawLang = String(msg.payload.lang ?? "en").split("-")[0]?.toLowerCase() ?? "en";
+          const lang = /^[a-z]{2,3}$/.test(rawLang) ? rawLang : "en";
+
+          if (captureDir) {
             const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120) || "session";
             const sub = path.join(captureDir, safe);
             fs.mkdirSync(sub, { recursive: true });
-            const mimeHint = String(msg.payload.mimeType ?? "audio/webm");
             const ext = mimeHint.includes("mp4") ? "m4a" : "webm";
-            const fn = `ws-${Date.now()}.${ext}`;
-            fs.writeFileSync(path.join(sub, fn), buf);
+            fs.writeFileSync(path.join(sub, `ws-${Date.now()}.${ext}`), buf);
+          }
+
+          const partialId = crypto.randomUUID();
+          manager.broadcast(sessionId, {
+            type: "TRANSCRIPT_PARTIAL",
+            payload: { id: partialId, sessionId, speakerId },
+          });
+
+          let text: string;
+          try {
+            text = await desktopTranscriptionService.transcribe(buf, lang, mimeHint);
+          } catch (err) {
+            logger.error("audio:chunk local transcription failed", err);
+            manager.broadcast(sessionId, { type: "TRANSCRIPT_PARTIAL_CANCEL", payload: { id: partialId } });
+            socket.send(JSON.stringify({ type: "error", payload: { message: "Transcription failed" } }));
+            return;
+          }
+
+          if (!text) {
+            manager.broadcast(sessionId, { type: "TRANSCRIPT_PARTIAL_CANCEL", payload: { id: partialId } });
+            return;
+          }
+
+          const result = processChunk(store, {
+            sessionId,
+            userId,
+            text,
+            speakerId,
+            context: msg.payload.context as Record<string, string> | undefined,
+          }, sqlite);
+          manager.broadcast(sessionId, { type: "TRANSCRIPT_FINAL", payload: { ...result.entry, partialId } });
+          manager.broadcast(sessionId, { type: "transcript:chunk", payload: result.entry });
+          manager.broadcast(sessionId, { type: "prompt:update", payload: result.prompts });
+          if (result.signals.length) {
+            manager.broadcast(sessionId, { type: "signal:detected", payload: result.signals });
           }
           return;
         }

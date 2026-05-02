@@ -8,6 +8,7 @@ import { registerSystemIpcHandlers } from "@/ipc/system.ipc";
 import { registerInterviewIpcHandlers } from "@/ipc/interview.ipc";
 import { registerDisplayIpcHandlers } from "@/ipc/display.ipc";
 import { startEmbeddedServer } from "@/server/embedded";
+import { desktopTranscriptionService } from "@/server/transcription";
 import { ExportService } from "@/services/export.service";
 import { logger } from "@/utils/logger";
 import { createAppWindow } from "@/main/window";
@@ -48,8 +49,11 @@ async function bootstrap() {
 
   embeddedPort = await findFreePort(3000);
   registerInterviewIpcHandlers(embeddedPort);
-  embedded = startEmbeddedServer(embeddedPort, app.getPath("userData"));
+  const userData = app.getPath("userData");
+  desktopTranscriptionService.setModelsDir(require("path").join(userData, "whisper-models"));
+  embedded = startEmbeddedServer(embeddedPort, userData);
   logger.info(`Embedded HUD server started on port ${embeddedPort}`);
+  void desktopTranscriptionService.warmup();
 
   await createAppWindow(embeddedPort);
 }
